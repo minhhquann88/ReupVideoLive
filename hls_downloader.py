@@ -6,11 +6,13 @@ import subprocess
 import tempfile
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from urllib.parse import urljoin
 
 import requests
+
+from ffbin import FFMPEG
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -69,10 +71,16 @@ def fetch_text(session, url, timeout=20):
     if r.status_code == 403:
         exp = link_expiry(url)
         hint = f" (hạn token: {exp:%H:%M:%S %d/%m})" if exp else ""
+        if re.search(r"[?&](sdk_sid|dMod)=", url):
+            why = ("Link này copy từ tab Network của trình duyệt: trình phát đã dùng nó để phát video, "
+                   "mà mỗi link Nimo chỉ gọi được 1 lần.\n")
+        else:
+            why = "Mỗi link Nimo chỉ gọi được 1 lần (hoặc đã hết hạn).\n"
         raise LinkForbidden(
             f"Server từ chối link (403: {r.headers.get('x-exception-info', 'forbidden')}){hint}.\n"
-            "Link Nimo có chữ ký và chỉ dùng được trong thời gian ngắn - hãy lấy link m3u8 mới "
-            "(F12 → Network → lọc 'm3u8' khi mở video).")
+            + why +
+            "Hãy lấy link chưa dùng từ response API (liveVideoViewList → videoUrl / "
+            "multiResolutionVideoUrl) và dán vào tool ngay, không mở video trên web trước.")
     r.raise_for_status()
     return r.text
 
@@ -181,7 +189,8 @@ class HLSDownloader:
             return seg.url + ("&" if "?" in seg.url else "?") + self._query
         return seg.url
 
-    def _download_segment(self, seg, path, retries=5):
+    def _download_segment(self, seg, retries=5):
+        """Tải 1 segment, trả bytes (giữ trong RAM, không ghi file tạm)."""
         for attempt in range(retries):
             if self._stop.is_set():
                 raise DownloadCancelled()
@@ -197,10 +206,8 @@ class HLSDownloader:
                 if r.status_code == 403:
                     raise LinkForbidden("Segment bị từ chối (403) - link đã hết hạn, hãy lấy link mới.")
                 r.raise_for_status()
-                with open(path, "wb") as f:
-                    f.write(r.content)
                 self.bytes_done += len(r.content)
-                return path
+                return r.content
             except (DownloadCancelled, LinkForbidden):
                 raise
             except Exception as e:
@@ -210,33 +217,132 @@ class HLSDownloader:
 
     # ---------- main ----------
     def run(self):
-        tmpdir = tempfile.mkdtemp(prefix="nimo_dl_")
-        ts_path = os.path.join(tmpdir, "joined.ts")
+        """Segment được ghi thẳng vào ffmpeg (stdin) theo thứ tự -> không có file .ts tạm,
+        ổ đĩa chỉ cần chỗ cho file MP4 đầu ra."""
+        pl = self.playlist or parse_playlist(self.session, self.url)
+        self._query = pl.query
+        if pl.encrypted:
+            self.on_log("⚠ Playlist có mã hoá (EXT-X-KEY) - có thể không phát được.")
+        self.on_info(pl)
+        out_dir = os.path.dirname(os.path.abspath(self.output))
+        os.makedirs(out_dir, exist_ok=True)
+        ok = False
         try:
-            pl = self.playlist or parse_playlist(self.session, self.url)
-            self._query = pl.query
-            if pl.encrypted:
-                self.on_log("⚠ Playlist có mã hoá (EXT-X-KEY) - có thể không phát được.")
-            self.on_info(pl)
             if pl.is_live:
                 self.on_log("🔴 Phát hiện LIVE stream - đang ghi, bấm Dừng để kết thúc và lưu.")
-                self._run_live(pl, ts_path)
-                trim_offset = 0.0
+                self._open_ffmpeg(0.0, None)
+                written = self._run_live(pl)
             else:
                 self.on_log(f"📼 VOD: {len(pl.segments)} segment, dài {fmt_time(pl.total_duration)}")
-                trim_offset = self._run_vod(pl, tmpdir, ts_path)
-
-            if not os.path.exists(ts_path) or os.path.getsize(ts_path) == 0:
+                written = self._run_vod(pl)
+            self._close_ffmpeg(abort=written == 0)
+            if written == 0:
                 raise RuntimeError("Không có dữ liệu nào được tải.")
-            self._remux(ts_path, trim_offset)
+            ok = True
             self.on_log(f"✅ Hoàn tất: {self.output}")
             return self.output
         finally:
-            shutil.rmtree(tmpdir, ignore_errors=True)
+            if not ok:
+                self._close_ffmpeg(abort=True)
+                self._remove_partial()
 
-    def _run_vod(self, pl, tmpdir, ts_path):
+    # ---------- ffmpeg pipe ----------
+    def _open_ffmpeg(self, offset, trim_len):
+        self.on_log("🎬 Ghi thẳng sang MP4 (không nén lại, không dùng file tạm)...")
+        cmd = [FFMPEG, "-y", "-hide_banner", "-loglevel", "error", "-f", "mpegts"]
+        if offset > 0.05:
+            cmd += ["-ss", f"{offset:.3f}"]
+        cmd += ["-i", "pipe:0"]
+        if trim_len:
+            cmd += ["-t", f"{trim_len:.3f}"]
+        cmd += ["-map", "0:v?", "-map", "0:a?", "-c", "copy", "-bsf:a", "aac_adtstoasc",
+                "-movflags", "+faststart", self.output]
+        self._ff_err = tempfile.TemporaryFile()
+        self._ff = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                    stderr=self._ff_err, creationflags=CREATE_NO_WINDOW)
+
+    def _ff_error(self):
+        try:
+            self._ff_err.seek(0)
+            return self._ff_err.read().decode("utf-8", "replace")[-800:]
+        except Exception:
+            return ""
+
+    def _feed(self, data):
+        """Ghi vào ffmpeg. Trả False khi ffmpeg đã tự kết thúc thành công (đủ -t khi tải 1 đoạn)
+        -> không cần gửi thêm dữ liệu."""
+        try:
+            self._ff.stdin.write(data)
+            return True
+        except (BrokenPipeError, OSError):
+            if self._ff.wait() == 0:
+                return False
+            raise RuntimeError("ffmpeg lỗi: " + self._explain(self._ff_error()))
+
+    def _close_ffmpeg(self, abort=False):
+        ff = getattr(self, "_ff", None)
+        if ff is None:
+            return
+        self._ff = None
+        if abort:
+            ff.kill()
+            ff.wait()
+            return
+        try:
+            ff.stdin.close()
+        except OSError:   # ffmpeg đã tự đóng pipe
+            pass
+        if ff.wait() != 0:
+            raise RuntimeError("ffmpeg lỗi: " + self._explain(self._ff_error()))
+
+    def _explain(self, err):
+        if "No space left" in err:
+            free = shutil.disk_usage(os.path.dirname(os.path.abspath(self.output))).free
+            return (f"Ổ đĩa đã đầy (còn {free / 1e9:.1f} GB). Hãy giải phóng dung lượng, chọn ổ khác "
+                    "hoặc chỉ tải 1 đoạn / chất lượng thấp hơn.\n" + err)
+        return err
+
+    def _remove_partial(self):
+        try:
+            if os.path.exists(self.output):
+                os.remove(self.output)
+                self.on_log(f"🗑 Đã xoá file dở dang: {self.output}")
+        except OSError:
+            pass
+
+    MIN_FREE = 300 * 10**6   # dừng khi ổ còn ít hơn mức này
+
+    def _free_space(self):
+        return shutil.disk_usage(os.path.dirname(os.path.abspath(self.output))).free
+
+    def _check_space(self, done_sec, total_sec):
+        """Ước lượng dung lượng file ra từ phần đã tải (1 lần) + theo dõi chỗ trống liên tục."""
+        free = self._free_space()
+        if free < self.MIN_FREE:
+            raise RuntimeError(
+                f"Ổ đĩa sắp đầy (còn {free / 1e6:.0f} MB) - đã dừng tải.\n"
+                "Hãy chọn thư mục lưu ở ổ khác, giải phóng dung lượng, chọn chất lượng thấp hơn "
+                "hoặc chỉ tải 1 đoạn (từ–đến).")
+        if self._space_checked or done_sec < 60 and done_sec < total_sec:
+            return
+        self._space_checked = True
+        need = self.bytes_done / done_sec * total_sec
+        written = os.path.getsize(self.output) if os.path.exists(self.output) else 0
+        left = need - written
+        self.on_log(f"💾 Ước tính file ~{need / 1e9:.1f} GB, ổ còn trống {free / 1e9:.1f} GB")
+        if left > free * 2:
+            raise RuntimeError(
+                f"Không đủ dung lượng: file cần khoảng {need / 1e9:.1f} GB nhưng ổ chỉ còn {free / 1e9:.1f} GB.\n"
+                "Hãy chọn thư mục lưu ở ổ khác, giải phóng dung lượng, chọn chất lượng thấp hơn "
+                "hoặc chỉ tải 1 đoạn (từ–đến).")
+        if left > free:
+            self.on_log("⚠ Có thể không đủ dung lượng - vẫn tải tiếp, sẽ dừng nếu ổ sắp đầy.")
+
+    # ---------- VOD ----------
+    def _run_vod(self, pl):
         segs = pl.segments
         start, end = self.start, self.end
+        offset, trim_len = 0.0, None
         if start is not None or end is not None:
             s = start or 0.0
             e = end if end is not None else pl.total_duration
@@ -244,93 +350,84 @@ class HLSDownloader:
             if not segs:
                 raise ValueError("Khoảng thời gian chọn nằm ngoài video")
             self.on_log(f"✂ Chỉ tải đoạn {fmt_time(s)} → {fmt_time(e)} ({len(segs)} segment)")
+            first = segs[0].start
+            offset = max(0.0, s - first)
+            if end is not None:
+                trim_len = end - max(s, first)
         total = len(segs)
-        paths = {}
-        done = 0
+        total_sec = sum(x.duration for x in segs)
+        self._space_checked = False
+        self._open_ffmpeg(offset, trim_len)
         self.on_progress(0, total, 0)
+        window = max(4, self.threads * 3)   # số segment tải trước, giữ trong RAM
+        done_sec = 0.0
         with ThreadPoolExecutor(max_workers=self.threads) as ex:
-            futs = {ex.submit(self._download_segment, sg, os.path.join(tmpdir, f"{i:06d}.ts")): i
-                    for i, sg in enumerate(segs)}
+            futs = {}
             try:
-                for fut in as_completed(futs):
-                    paths[futs[fut]] = fut.result()
-                    done += 1
-                    self.on_progress(done, total, self.bytes_done)
+                for i in range(total):
+                    for j in range(i, min(total, i + window)):
+                        if j not in futs:
+                            futs[j] = ex.submit(self._download_segment, segs[j])
+                    data = futs.pop(i).result()
+                    if not self._feed(data):   # ffmpeg đã lấy đủ đoạn cần cắt
+                        for f in futs.values():
+                            f.cancel()
+                        self.on_progress(total, total, self.bytes_done)
+                        break
+                    done_sec += segs[i].duration
+                    if i % 10 == 0 or i == total - 1:
+                        self._check_space(done_sec, total_sec)
+                    self.on_progress(i + 1, total, self.bytes_done)
             except BaseException:
                 self._stop.set()
-                for f in futs:
+                for f in futs.values():
                     f.cancel()
                 raise
-        self.on_log("🔗 Đang ghép segment...")
-        with open(ts_path, "wb") as out:
-            for i in range(total):
-                with open(paths[i], "rb") as f:
-                    shutil.copyfileobj(f, out)
-                os.remove(paths[i])
-        # Precise trim offset inside the joined file
-        self._trim_len = None
-        if start is not None or end is not None:
-            first = segs[0].start
-            off = max(0.0, (start or 0.0) - first)
-            if end is not None:
-                self._trim_len = end - max(start or 0.0, first)
-            return off
-        return 0.0
+        return total
 
-    def _run_live(self, pl, ts_path):
+    # ---------- LIVE ----------
+    def _run_live(self, pl):
         seen = set()
-        self._trim_len = None
         count = 0
         recorded = 0.0  # seconds of media written
-        with open(ts_path, "wb") as out:
-            while not self._stop.is_set():
-                new = [s for s in pl.segments if s.url.split("?")[0] not in seen]
-                for seg in new:
-                    if self._stop.is_set():
-                        break
-                    seen.add(seg.url.split("?")[0])
-                    p = ts_path + ".part"
-                    try:
-                        self._download_segment(seg, p)
-                    except DownloadCancelled:
-                        break
-                    except Exception as e:
-                        self.on_log(f"⚠ {e}")
-                        continue
-                    with open(p, "rb") as f:
-                        shutil.copyfileobj(f, out)
-                    out.flush()
-                    count += 1
-                    recorded += seg.duration
-                    self.on_progress(count, 0, self.bytes_done)
-                    if self.end is not None and recorded >= self.end:
-                        self.on_log("⏱ Đã đủ thời lượng ghi.")
-                        self._stop.set()
-                if not pl.is_live:
-                    self.on_log("Stream đã kết thúc.")
-                    break
-                # wait then refresh playlist
-                self._stop.wait(max(1.0, pl.target_duration / 2))
+        while not self._stop.is_set():
+            new = [s for s in pl.segments if s.url.split("?")[0] not in seen]
+            for seg in new:
                 if self._stop.is_set():
                     break
+                seen.add(seg.url.split("?")[0])
                 try:
-                    pl = parse_playlist(self.session, pl.url)
+                    data = self._download_segment(seg)
+                except DownloadCancelled:
+                    break
                 except Exception as e:
-                    self.on_log(f"⚠ Lỗi làm mới playlist: {e}")
+                    self.on_log(f"⚠ {e}")
+                    continue
+                if not self._feed(data):
+                    self._stop.set()
+                    break
+                count += 1
+                if count % 10 == 0:
+                    self._space_checked = True
+                    self._check_space(0, 0)
+                recorded += seg.duration
+                self.on_progress(count, 0, self.bytes_done)
+                if self.end is not None and recorded >= self.end:
+                    self.on_log("⏱ Đã đủ thời lượng ghi.")
+                    self._stop.set()
+            if not pl.is_live:
+                self.on_log("Stream đã kết thúc.")
+                break
+            # wait then refresh playlist
+            self._stop.wait(max(1.0, pl.target_duration / 2))
+            if self._stop.is_set():
+                break
+            try:
+                pl = parse_playlist(self.session, pl.url)
+            except Exception as e:
+                self.on_log(f"⚠ Lỗi làm mới playlist: {e}")
         self.on_log(f"Đã ghi {count} segment.")
-
-    def _remux(self, ts_path, offset):
-        self.on_log("🎬 Đang chuyển sang MP4 (không nén lại)...")
-        cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
-        if offset > 0.05:
-            cmd += ["-ss", f"{offset:.3f}"]
-        cmd += ["-i", ts_path]
-        if self._trim_len:
-            cmd += ["-t", f"{self._trim_len:.3f}"]
-        cmd += ["-c", "copy", "-bsf:a", "aac_adtstoasc", "-movflags", "+faststart", self.output]
-        p = subprocess.run(cmd, capture_output=True, text=True, creationflags=CREATE_NO_WINDOW)
-        if p.returncode != 0:
-            raise RuntimeError("ffmpeg lỗi: " + p.stderr[-800:])
+        return count
 
 
 if __name__ == "__main__":

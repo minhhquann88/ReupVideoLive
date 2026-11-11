@@ -1,22 +1,24 @@
 """Nimo Tool - tải video live/VOD Nimo TV (m3u8) và chỉnh sửa video. PySide6 + ffmpeg."""
+import json
 import os
-import shutil
 import sys
 import time
 
 from PySide6.QtCore import QObject, QProcess, Qt, QThread, QUrl, Signal
-from PySide6.QtGui import QFont
-from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
-from PySide6.QtMultimediaWidgets import QVideoWidget
+from PySide6.QtGui import QColor, QFont, QImage
+from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer, QVideoFrame, QVideoSink
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout,
+    QApplication, QCheckBox, QColorDialog, QComboBox, QFileDialog, QFormLayout,
     QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget, QMainWindow, QMessageBox,
-    QPlainTextEdit, QProgressBar, QPushButton, QSlider, QSpinBox, QTabWidget, QVBoxLayout,
+    QPlainTextEdit, QProgressBar, QPushButton, QSlider, QSpinBox, QSplitter, QTabWidget, QVBoxLayout,
     QWidget,
 )
 
+import compose_widgets as cw
+import ffbin
+import nimo_api
 import video_editor as ve
-from hls_downloader import HLSDownloader, LinkForbidden, fmt_time, link_expiry, parse_playlist, parse_time
+from hls_downloader import HLSDownloader, fmt_time, link_expiry, parse_playlist, parse_time
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_OUT = os.path.join(os.path.expanduser("~"), "Videos", "Nimo")
@@ -71,6 +73,33 @@ class AnalyzeWorker(QObject):
             self.done.emit(None, str(e))
 
 
+class ResolveWorker(QObject):
+    """URL video nimo.tv/v/v-... + kênh -> NimoVideo qua API videoListForAgg."""
+    done = Signal(object, str)
+    log = Signal(str)
+
+    def __init__(self, video, channel, early_stop=True):
+        super().__init__()
+        self.video, self.channel, self.early_stop = video, channel, early_stop
+
+    def run(self):
+        try:
+            room = nimo_api.resolve_room_id(self.channel)
+            self.log.emit(f"Kênh → roomId {room}, đang tìm video {nimo_api.parse_video_id(self.video)}...")
+            v = nimo_api.find_video(room, self.video, early_stop=self.early_stop,
+                                    on_page=lambda p: self.log.emit(f"  ... trang {p}"))
+            if v is None and self.early_stop:
+                self.log.emit("Không thấy khi dừng sớm, duyệt hết các trang (video upload cũ?)...")
+                v = nimo_api.find_video(room, self.video, early_stop=False,
+                                        on_page=lambda p: self.log.emit(f"  ... trang {p}"))
+            if v is None:
+                self.done.emit(None, f"Không tìm thấy video trong room {room} (đã bị xoá hoặc sai kênh).")
+            else:
+                self.done.emit(v, "")
+        except Exception as e:
+            self.done.emit(None, str(e) or e.__class__.__name__)
+
+
 class DownloadTab(QWidget):
     open_in_editor = Signal(str)
 
@@ -85,9 +114,25 @@ class DownloadTab(QWidget):
         g = QGroupBox("Link video Nimo (.m3u8 - live hoặc VOD)")
         gl = QVBoxLayout(g)
         self.url = QPlainTextEdit()
-        self.url.setPlaceholderText("Dán link m3u8 vào đây (F12 → Network → lọc 'm3u8' khi xem trên nimo.tv)")
+        self.url.setPlaceholderText("Dán link video Nimo (https://www.nimo.tv/v/v-...) rồi bấm 'Lấy link', "
+                                    "hoặc dán thẳng link m3u8")
         self.url.setMaximumHeight(70)
         gl.addWidget(self.url)
+        api_row = QHBoxLayout()
+        api_row.addWidget(QLabel("Kênh:"))
+        self.channel = QLineEdit("thaygiaoba")
+        self.channel.setPlaceholderText("alias / URL kênh / roomId")
+        self.channel.setMaximumWidth(220)
+        api_row.addWidget(self.channel)
+        api_row.addWidget(QLabel("Chất lượng:"))
+        self.res = QComboBox()
+        self.res.addItems(["1080", "720", "480"])
+        api_row.addWidget(self.res)
+        self.btn_resolve = QPushButton("🎬 Lấy link từ video Nimo")
+        self.btn_resolve.clicked.connect(self.resolve)
+        api_row.addWidget(self.btn_resolve)
+        api_row.addStretch()
+        gl.addLayout(api_row)
         row = QHBoxLayout()
         self.btn_analyze = QPushButton("🔍 Phân tích link")
         self.btn_analyze.clicked.connect(self.analyze)
@@ -161,11 +206,49 @@ class DownloadTab(QWidget):
     def append_log(self, s):
         self.log.appendPlainText(f"[{time.strftime('%H:%M:%S')}] {s}")
 
+    # ---- resolve nimo.tv/v/ URL via API ----
+    def resolve(self):
+        text = self._url()
+        if not text:
+            QMessageBox.warning(self, "Thiếu link", "Dán link video Nimo (nimo.tv/v/v-...) hoặc id video.")
+            return
+        try:
+            nimo_api.parse_video_id(text)
+        except ValueError as e:
+            QMessageBox.warning(self, "Link không hợp lệ", str(e))
+            return
+        self.btn_resolve.setEnabled(False)
+        self.lbl_info.setText("Đang tìm video qua API...")
+
+        def wire(w):
+            w.log.connect(self.append_log)
+            w.done.connect(self._resolved)
+        self._run_in_thread(ResolveWorker(text, self.channel.text().strip() or "thaygiaoba"), "_rs", wire)
+
+    def _resolved(self, v, err):
+        self.btn_resolve.setEnabled(True)
+        if err:
+            self.lbl_info.setText(f"<span style='color:#e55'>❌ {err}</span>")
+            self.append_log("❌ " + err)
+            return
+        s = v.best_stream(int(self.res.currentText()))
+        self.url.setPlainText(s.url)
+        self.analyzed = None
+        created = time.strftime("%d/%m/%Y %H:%M", time.localtime(v.created_at))
+        self.append_log(f"✅ {v.title} · {created} · dài {fmt_time(v.duration_sec)} · "
+                        f"có {', '.join(f'{x.res}P' for x in v.streams)} → chọn {s.res}P")
+        self.lbl_info.setText(f"<b>{v.title}</b> · {created} · {fmt_time(v.duration_sec)} · {s.res}P")
+        safe = "".join(c for c in v.title if c.isalnum() or c in " -_").strip().replace(" ", "_")[:40]
+        name = f"nimo_{time.strftime('%Y%m%d', time.localtime(v.created_at))}_{safe or v.id}_{s.res}p.mp4"
+        self.out.setText(os.path.join(os.path.dirname(self.out.text()) or DEFAULT_OUT, name))
+
     # ---- analyze ----
     def analyze(self):
         url = self._url()
         if not url:
             return
+        if nimo_api.is_video_url(url):
+            return self.resolve()
         exp = link_expiry(url)
         self.lbl_info.setText("Đang phân tích..." + (f" (token hết hạn lúc {exp:%H:%M:%S %d/%m})" if exp else ""))
         self.btn_analyze.setEnabled(False)
@@ -197,6 +280,10 @@ class DownloadTab(QWidget):
         url = self._url()
         if not url:
             QMessageBox.warning(self, "Thiếu link", "Hãy dán link m3u8.")
+            return
+        if nimo_api.is_video_url(url):
+            QMessageBox.information(self, "Link trang video",
+                                    "Đây là link trang video - bấm '🎬 Lấy link từ video Nimo' trước.")
             return
         out = self.out.text().strip()
         if not out.lower().endswith(".mp4"):
@@ -346,14 +433,31 @@ class FFmpegRunner(QObject):
 
 # ============================================================ Editor
 
+class FrameConverter(QObject):
+    """Chạy ở luồng phụ: QVideoFrame -> QImage đã thu nhỏ, đúng định dạng để vẽ nhanh."""
+    ready = Signal(QImage)
+    MAX_W, MAX_H = 1280, 720
+
+    def convert(self, frame):
+        img = frame.toImage()
+        if not img.isNull():
+            if img.width() > self.MAX_W or img.height() > self.MAX_H:
+                img = img.scaled(self.MAX_W, self.MAX_H, Qt.KeepAspectRatio, Qt.FastTransformation)
+            img = img.convertToFormat(QImage.Format_ARGB32_Premultiplied)
+        self.ready.emit(img)
+
+
 class EditorTab(QWidget):
+    """Chọn nhiều vùng cắt trên video (kéo thả) rồi ghép vào 1 video theo bố cục tự sắp xếp."""
+    _conv_request = Signal(QVideoFrame)
+
     def __init__(self):
         super().__init__()
         self.info = None
-        lay = QHBoxLayout(self)
+        self.model = cw.RegionModel()
+        self._syncing = False
+        root = QVBoxLayout(self)
 
-        # ---- left: player
-        left = QVBoxLayout()
         in_row = QHBoxLayout()
         self.inp = QLineEdit()
         self.inp.setPlaceholderText("Chọn video cần chỉnh sửa...")
@@ -362,22 +466,42 @@ class EditorTab(QWidget):
         b.clicked.connect(self._browse_in)
         in_row.addWidget(self.inp)
         in_row.addWidget(b)
-        left.addLayout(in_row)
+        self.lbl_meta = QLabel("")
+        in_row.addWidget(self.lbl_meta)
+        root.addLayout(in_row)
 
-        self.video = QVideoWidget()
-        self.video.setMinimumSize(480, 270)
-        self.video.setStyleSheet("background:black")
-        left.addWidget(self.video, 1)
+        split = QSplitter(Qt.Horizontal)
+        root.addWidget(split, 1)
+
+        # ---- 1. video gốc: kéo để chọn vùng
+        left = QWidget()
+        ll = QVBoxLayout(left)
+        ll.setContentsMargins(0, 0, 0, 0)
+        hint = QLabel("<b>1. Video gốc</b> - kéo chuột để chọn vùng cắt · kéo góc để chỉnh · Delete để xoá")
+        hint.setWordWrap(True)
+        ll.addWidget(hint)
+        self.frame = cw.FrameView(self.model)
+        ll.addWidget(self.frame, 1)
         self.player = QMediaPlayer(self)
         self.audio = QAudioOutput(self)
         self.player.setAudioOutput(self.audio)
-        self.player.setVideoOutput(self.video)
+        self.sink = QVideoSink(self)
+        self.player.setVideoOutput(self.sink)
+        self.sink.videoFrameChanged.connect(self._frame)
+        self._conv_busy = False
+        self._conv_pending = None
+        self._conv_thread = QThread(self)
+        self._conv = FrameConverter()
+        self._conv.moveToThread(self._conv_thread)
+        self._conv_request.connect(self._conv.convert)
+        self._conv.ready.connect(self._converted)
+        self._conv_thread.start()
         self.player.positionChanged.connect(self._pos_changed)
         self.player.durationChanged.connect(lambda d: self.slider.setRange(0, d))
-
+        self.player.mediaStatusChanged.connect(self._media_status)
         self.slider = QSlider(Qt.Horizontal)
         self.slider.sliderMoved.connect(self.player.setPosition)
-        left.addWidget(self.slider)
+        ll.addWidget(self.slider)
         ctl = QHBoxLayout()
         self.btn_play = QPushButton("▶")
         self.btn_play.setMaximumWidth(40)
@@ -391,79 +515,133 @@ class EditorTab(QWidget):
         self.lbl_pos = QLabel("00:00:00 / 00:00:00")
         ctl.addWidget(self.lbl_pos)
         ctl.addStretch()
-        b_in = QPushButton("[ Đặt điểm đầu")
+        ll.addLayout(ctl)
+        rng = QHBoxLayout()
+        rng.addWidget(QLabel("Đoạn xuất: từ"))
+        self.start = time_edit("đầu video")
+        rng.addWidget(self.start)
+        b_in = QPushButton("[ Đặt")
+        b_in.setToolTip("Lấy vị trí đang xem làm điểm đầu")
         b_in.clicked.connect(lambda: self.start.setText(self._cur_time()))
-        b_out = QPushButton("Đặt điểm cuối ]")
+        rng.addWidget(b_in)
+        rng.addWidget(QLabel("đến"))
+        self.end = time_edit("cuối video")
+        rng.addWidget(self.end)
+        b_out = QPushButton("Đặt ]")
+        b_out.setToolTip("Lấy vị trí đang xem làm điểm cuối")
         b_out.clicked.connect(lambda: self.end.setText(self._cur_time()))
-        ctl.addWidget(b_in)
-        ctl.addWidget(b_out)
-        left.addLayout(ctl)
-        self.lbl_meta = QLabel("")
-        left.addWidget(self.lbl_meta)
-        lay.addLayout(left, 3)
+        rng.addWidget(b_out)
+        rng.addStretch()
+        ll.addLayout(rng)
+        split.addWidget(left)
 
-        # ---- right: options
-        right = QVBoxLayout()
-        g = QGroupBox("Cắt")
-        f = QFormLayout(g)
-        self.start = time_edit()
-        self.end = time_edit()
-        f.addRow("Điểm đầu:", self.start)
-        f.addRow("Điểm cuối:", self.end)
-        self.fast = QCheckBox("Cắt nhanh (không nén lại, chỉ khi không dùng hiệu ứng)")
-        f.addRow(self.fast)
-        right.addWidget(g)
-
-        g = QGroupBox("Khung hình & hiệu ứng")
-        f = QFormLayout(g)
-        self.aspect = QComboBox()
-        self.aspect.addItems(ve.ASPECTS.keys())
-        f.addRow("Tỉ lệ:", self.aspect)
-        self.res = QComboBox()
-        self.res.addItems(ve.RESOLUTIONS.keys())
-        f.addRow("Độ phân giải:", self.res)
-        self.speed = QDoubleSpinBox()
-        self.speed.setRange(0.25, 4.0)
-        self.speed.setSingleStep(0.25)
-        self.speed.setValue(1.0)
-        self.speed.setSuffix(" x")
-        f.addRow("Tốc độ:", self.speed)
-        self.vol = QSpinBox()
-        self.vol.setRange(0, 300)
-        self.vol.setValue(100)
-        self.vol.setSuffix(" %  (0 = tắt tiếng)")
-        f.addRow("Âm lượng:", self.vol)
-        self.wm = QLineEdit()
-        self.wm.setPlaceholderText("vd: @kenh_cua_ban (để trống = không có)")
-        f.addRow("Chữ watermark:", self.wm)
-        self.wm_pos = QComboBox()
-        self.wm_pos.addItems(ve.WATERMARK_POS.keys())
-        f.addRow("Vị trí chữ:", self.wm_pos)
-        right.addWidget(g)
-
-        g = QGroupBox("Xuất file")
-        f = QFormLayout(g)
-        self.crf = QSpinBox()
-        self.crf.setRange(14, 35)
-        self.crf.setValue(23)
-        self.crf.setToolTip("Càng nhỏ càng đẹp, file càng nặng")
-        f.addRow("Chất lượng (CRF):", self.crf)
+        # ---- 2. khung xuất: sắp xếp bố cục
+        mid = QWidget()
+        ml = QVBoxLayout(mid)
+        ml.setContentsMargins(0, 0, 0, 0)
+        hint = QLabel("<b>2. Bố cục video xuất</b> - kéo để di chuyển · kéo góc để phóng to/thu nhỏ")
+        hint.setWordWrap(True)
+        ml.addWidget(hint)
+        self.canvas = cw.LayoutCanvas(self.model)
+        ml.addWidget(self.canvas, 1)
+        crow = QHBoxLayout()
         self.preset = QComboBox()
-        self.preset.addItems(["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow"])
-        self.preset.setCurrentText("veryfast")
-        f.addRow("Tốc độ nén:", self.preset)
-        self.audio_only = QCheckBox("Chỉ xuất âm thanh (MP3)")
-        f.addRow(self.audio_only)
+        self.preset.addItems(ve.CANVAS_PRESETS.keys())
+        crow.addWidget(self.preset, 1)
+        self.cw_ = QSpinBox()
+        self.ch_ = QSpinBox()
+        for sp in (self.cw_, self.ch_):
+            sp.setRange(64, 4096)
+            sp.setSingleStep(2)
+        self.cw_.setValue(1080)
+        self.ch_.setValue(1920)
+        for sp in (self.cw_, self.ch_):
+            sp.valueChanged.connect(self._canvas_size_changed)
+        crow.addWidget(self.cw_)
+        crow.addWidget(QLabel("x"))
+        crow.addWidget(self.ch_)
+        self.btn_bg = QPushButton("Màu nền")
+        self.btn_bg.clicked.connect(self._pick_bg)
+        crow.addWidget(self.btn_bg)
+        ml.addLayout(crow)
+        lrow = QHBoxLayout()
+        lrow.addWidget(QLabel("Xếp nhanh:"))
+        for text, mode in (("Dọc", "vertical"), ("Ngang", "horizontal"), ("Lưới", "grid")):
+            bb = QPushButton(text)
+            bb.clicked.connect(lambda _=False, m=mode: self.model.auto_layout(m))
+            lrow.addWidget(bb)
+        self.keep = QCheckBox("Giữ tỉ lệ")
+        self.keep.setToolTip("Bỏ chọn để kéo giãn vùng tự do (méo hình)")
+        self.keep.setChecked(True)
+        self.keep.toggled.connect(lambda on: setattr(self.model, "keep_ratio", on))
+        lrow.addWidget(self.keep)
+        lrow.addStretch()
+        ml.addLayout(lrow)
+        split.addWidget(mid)
+
+        # ---- 3. danh sách vùng + xuất
+        right = QWidget()
+        rl = QVBoxLayout(right)
+        rl.setContentsMargins(0, 0, 0, 0)
+        rl.addWidget(QLabel("<b>3. Các vùng</b> (vùng sau nằm đè lên vùng trước)"))
+        self.lst = QListWidget()
+        self.lst.setMaximumHeight(130)
+        self.lst.currentRowChanged.connect(lambda i: None if self._syncing else self.model.select(i))
+        rl.addWidget(self.lst)
+        brow = QHBoxLayout()
+        for text, fn, tip in (("🗑", lambda: self.model.remove(), "Xoá vùng (Delete)"),
+                              ("⬆", lambda: self.model.move_layer(-1), "Đưa xuống lớp dưới"),
+                              ("⬇", lambda: self.model.move_layer(1), "Đưa lên lớp trên"),
+                              ("⛶", lambda: self.model.auto_layout("fill"), "Phóng vừa khung"),
+                              ("↔", lambda: self.model.auto_layout("center_h"), "Căn giữa ngang"),
+                              ("↕", lambda: self.model.auto_layout("center_v"), "Căn giữa dọc")):
+            bb = QPushButton(text)
+            bb.setToolTip(tip)
+            bb.setMaximumWidth(36)
+            bb.clicked.connect(fn)
+            brow.addWidget(bb)
+        brow.addStretch()
+        rl.addLayout(brow)
+
+        g = QGroupBox("Vùng đang chọn (pixel)")
+        gf = QFormLayout(g)
+        self.spin_src, self.spin_dst = [], []
+        for label, store in (("Cắt X, Y, R, C:", self.spin_src), ("Đặt X, Y, R, C:", self.spin_dst)):
+            row = QHBoxLayout()
+            for _ in range(4):
+                sp = QSpinBox()
+                sp.setRange(-8192, 8192)
+                sp.valueChanged.connect(self._spin_changed)
+                row.addWidget(sp)
+                store.append(sp)
+            gf.addRow(label, row)
+        rl.addWidget(g)
+        lay_row = QHBoxLayout()
+        b_save = QPushButton("💾 Lưu bố cục")
+        b_save.clicked.connect(self._save_layout)
+        b_load = QPushButton("📂 Mở bố cục")
+        b_load.clicked.connect(self._load_layout)
+        b_clear = QPushButton("Xoá hết")
+        b_clear.clicked.connect(lambda: self.model.clear())
+        for w in (b_save, b_load, b_clear):
+            lay_row.addWidget(w)
+        rl.addLayout(lay_row)
+
+        g = QGroupBox("Xuất video")
+        gf = QFormLayout(g)
         out_row = QHBoxLayout()
         self.out = QLineEdit()
         bo = QPushButton("...")
         bo.setMaximumWidth(40)
-        bo.clicked.connect(lambda: browse_save(self, self.out, "Media (*.mp4 *.mp3)"))
+        bo.clicked.connect(lambda: browse_save(self, self.out))
         out_row.addWidget(self.out)
         out_row.addWidget(bo)
-        f.addRow("Lưu vào:", out_row)
-        right.addWidget(g)
-
+        gf.addRow("Lưu vào:", out_row)
+        self.out_fps = QComboBox()
+        self.out_fps.addItems(["30 fps (nhanh, chuẩn TikTok/Shorts)", "Giữ nguyên như video gốc"])
+        self.out_fps.setToolTip("Video gốc 60 fps xuất ở 30 fps nhanh hơn ~1,7 lần")
+        gf.addRow("FPS xuất:", self.out_fps)
+        rl.addWidget(g)
         row = QHBoxLayout()
         self.btn_export = QPushButton("🎬 Xuất video")
         self.btn_export.setMinimumHeight(36)
@@ -473,20 +651,26 @@ class EditorTab(QWidget):
         self.btn_cancel.clicked.connect(lambda: self.runner.kill())
         row.addWidget(self.btn_export, 1)
         row.addWidget(self.btn_cancel)
-        right.addLayout(row)
+        rl.addLayout(row)
         self.bar = QProgressBar()
-        right.addWidget(self.bar)
+        rl.addWidget(self.bar)
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
-        self.log.setMaximumHeight(140)
-        right.addWidget(self.log)
-        lay.addLayout(right, 2)
+        rl.addWidget(self.log, 1)
+        split.addWidget(right)
+        split.setSizes([560, 380, 320])
 
         self.runner = FFmpegRunner(self)
         self.runner.progress.connect(self.bar.setValue)
         self.runner.log.connect(self.log.appendPlainText)
         self.runner.finished.connect(self._export_done)
+        self.model.changed.connect(self._sync_ui)
+        self.preset.currentTextChanged.connect(self._preset_changed)
+        self._preset_changed(self.preset.currentText())
+        self._set_bg(QColor("#000000"))
+        self._sync_ui()
 
+    # ---- video
     def _browse_in(self):
         p, _ = QFileDialog.getOpenFileName(self, "Chọn video", self.inp.text() or DEFAULT_OUT,
                                            "Video (*.mp4 *.ts *.mkv *.flv *.mov *.webm);;Tất cả (*.*)")
@@ -500,8 +684,8 @@ class EditorTab(QWidget):
         try:
             self.info = ve.probe(path)
             i = self.info
-            self.lbl_meta.setText(f"{i['width']}x{i['height']} · dài {fmt_time(i['duration'])}"
-                                  f" · {os.path.getsize(path) / 1e6:.1f} MB"
+            self.model.set_source_size(i["width"], i["height"])
+            self.lbl_meta.setText(f"{i['width']}x{i['height']} · {i['fps']:.0f} fps · dài {fmt_time(i['duration'])}"
                                   + ("" if i["has_audio"] else " · không có âm thanh"))
         except Exception as e:
             self.info = None
@@ -509,9 +693,41 @@ class EditorTab(QWidget):
         self.start.clear()
         self.end.clear()
         base, _ = os.path.splitext(path)
-        self.out.setText(base + "_edit.mp4")
+        self.out.setText(base + "_bocuc.mp4")
         self.player.setSource(QUrl.fromLocalFile(path))
         self.player.pause()
+
+    def _media_status(self, st):
+        if st == QMediaPlayer.LoadedMedia:   # hiện 1 frame để chọn vùng ngay
+            self.player.setPosition(min(1000, max(0, self.player.duration() // 2)))
+
+    def _frame(self, f):
+        """Frame mới từ player. Đổi sang ảnh ở luồng phụ; nếu luồng phụ đang bận thì chỉ giữ frame
+        mới nhất (bỏ các frame ở giữa) -> giao diện không bị nghẽn với video 1080p60."""
+        if not f.isValid():
+            return
+        if not self.info:
+            self.model.set_source_size(f.width(), f.height())
+        if self._conv_busy:
+            self._conv_pending = f
+            return
+        self._conv_busy = True
+        self._conv_request.emit(f)
+
+    def _converted(self, img):
+        self._conv_busy = False
+        if not img.isNull():
+            self.frame.set_image(img)
+            self.canvas.set_image(img)
+        if self._conv_pending is not None:
+            f, self._conv_pending = self._conv_pending, None
+            self._frame(f)
+
+    def shutdown(self):
+        self.player.stop()
+        self.runner.kill()
+        self._conv_thread.quit()
+        self._conv_thread.wait(2000)
 
     def _toggle_play(self):
         if self.player.playbackState() == QMediaPlayer.PlayingState:
@@ -530,45 +746,139 @@ class EditorTab(QWidget):
         ms = self.player.position()
         return f"{fmt_time(ms / 1000)}.{ms % 1000 // 100}"
 
+    # ---- khung xuất
+    def _preset_changed(self, name):
+        size = ve.CANVAS_PRESETS.get(name)
+        self.cw_.setEnabled(size is None)
+        self.ch_.setEnabled(size is None)
+        if size:
+            self._syncing = True
+            self.cw_.setValue(size[0])
+            self.ch_.setValue(size[1])
+            self._syncing = False
+            self.model.set_canvas(*size)
+
+    def _canvas_size_changed(self):
+        if not self._syncing:
+            self.model.set_canvas(self.cw_.value() // 2 * 2, self.ch_.value() // 2 * 2)
+
+    def _set_bg(self, c):
+        self.canvas.bg = c
+        self.btn_bg.setStyleSheet(f"background:{c.name()}; color:{'black' if c.lightness() > 128 else 'white'}")
+        self.canvas.update()
+
+    def _pick_bg(self):
+        c = QColorDialog.getColor(self.canvas.bg, self, "Màu nền")
+        if c.isValid():
+            self._set_bg(c)
+
+    # ---- đồng bộ danh sách / ô số
+    def _sync_ui(self):
+        self._syncing = True
+        try:
+            m = self.model
+            names = [f"{r.name} · cắt {int(r.sw)}x{int(r.sh)} → {int(r.dw)}x{int(r.dh)}" for r in m.regions]
+            if [self.lst.item(i).text() for i in range(self.lst.count())] != names:
+                self.lst.clear()
+                for i, n in enumerate(names):
+                    self.lst.addItem(n)
+                    self.lst.item(i).setForeground(cw.color_of(i))
+            self.lst.setCurrentRow(m.sel)
+            r = m.current()
+            for sp, v in zip(self.spin_src + self.spin_dst,
+                             (r.sx, r.sy, r.sw, r.sh, r.dx, r.dy, r.dw, r.dh) if r else (0,) * 8):
+                sp.setEnabled(r is not None)
+                sp.setValue(int(round(v)))
+            self.btn_export.setEnabled(bool(m.regions) and not self.runner.is_running())
+        finally:
+            self._syncing = False
+
+    def _spin_changed(self):
+        r = self.model.current()
+        if self._syncing or r is None:
+            return
+        keep = self.model.keep_ratio
+        self.model.keep_ratio = False   # nhập số = dùng đúng số người dùng gõ
+        try:
+            self.model.set_src(r, *[sp.value() for sp in self.spin_src])
+            self.model.set_dst(r, *[sp.value() for sp in self.spin_dst])
+        finally:
+            self.model.keep_ratio = keep
+
+    def _save_layout(self):
+        if not self.model.regions:
+            return
+        p, _ = QFileDialog.getSaveFileName(self, "Lưu bố cục", os.path.join(DEFAULT_OUT, "bocuc.json"),
+                                           "Bố cục (*.json)")
+        if p:
+            d = self.model.to_json()
+            d["bg"] = self.canvas.bg.name()
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump(d, f, indent=1)
+            self.log.appendPlainText(f"💾 Đã lưu bố cục: {p}")
+
+    def _load_layout(self):
+        p, _ = QFileDialog.getOpenFileName(self, "Mở bố cục", DEFAULT_OUT, "Bố cục (*.json)")
+        if p:
+            self.load_layout(p)
+
+    def load_layout(self, p):
+        try:
+            with open(p, encoding="utf-8") as f:
+                d = json.load(f)
+            self.model.from_json(d)
+            w, h = self.model.out_w, self.model.out_h
+            name = next((k for k, v in ve.CANVAS_PRESETS.items() if v == (w, h)), "Tuỳ chỉnh")
+            self._syncing = True
+            self.preset.setCurrentText(name)
+            self.cw_.setValue(w)
+            self.ch_.setValue(h)
+            self.cw_.setEnabled(name == "Tuỳ chỉnh")
+            self.ch_.setEnabled(name == "Tuỳ chỉnh")
+            self._syncing = False
+            self._set_bg(QColor(d.get("bg", "#000000")))
+        except Exception as e:
+            self._syncing = False
+            QMessageBox.warning(self, "Lỗi bố cục", str(e))
+
+    # ---- xuất
     def export(self):
         if self.runner.is_running():
             return
         src = self.inp.text().strip()
-        if not os.path.exists(src):
+        if not os.path.exists(src) or not self.info:
             QMessageBox.warning(self, "Thiếu video", "Hãy chọn video đầu vào.")
             return
+        if not self.model.regions:
+            QMessageBox.warning(self, "Chưa có vùng", "Kéo chuột trên video gốc để chọn ít nhất 1 vùng.")
+            return
         out = self.out.text().strip()
-        if self.audio_only.isChecked() and not out.lower().endswith(".mp3"):
-            out = os.path.splitext(out)[0] + ".mp3"
+        if not out.lower().endswith(".mp4"):
+            out += ".mp4"
             self.out.setText(out)
         if os.path.abspath(out) == os.path.abspath(src):
             QMessageBox.warning(self, "Trùng file", "File xuất phải khác file gốc.")
             return
+        i = self.info
+        fps = min(30.0, i["fps"]) if self.out_fps.currentIndex() == 0 else i["fps"]
         try:
-            o = ve.EditOptions(
-                input=src, output=out,
-                start=parse_time(self.start.text()), end=parse_time(self.end.text()),
-                aspect=self.aspect.currentText(), resolution=self.res.currentText(),
-                speed=self.speed.value(), volume=self.vol.value() / 100,
-                watermark=self.wm.text(), watermark_pos=self.wm_pos.currentText(),
-                fast_copy=self.fast.isChecked(), crf=self.crf.value(),
-                preset=self.preset.currentText(), audio_only=self.audio_only.isChecked())
-            cmd, dur = ve.build_edit_cmd(o)
+            cmd, dur = ve.build_compose_cmd(
+                src, out, self.model.regions, i["width"], i["height"], self.model.out_w, self.model.out_h,
+                bg=self.canvas.bg.name(), fps=fps, start=parse_time(self.start.text()),
+                end=parse_time(self.end.text()), has_audio=i["has_audio"], src_duration=i["duration"])
         except ValueError as e:
             QMessageBox.warning(self, "Sai tham số", str(e))
             return
-        if dur is None and self.info:
-            dur = (self.info["duration"] - (o.start or 0)) / o.speed
-        if o.fast_copy and ve.needs_reencode(o):
-            self.log.appendPlainText("ℹ Có hiệu ứng nên sẽ nén lại (bỏ qua 'cắt nhanh').")
+        os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
         self.player.pause()
+        self.btn_play.setText("▶")
         self.bar.setValue(0)
         self.btn_export.setEnabled(False)
         self.btn_cancel.setEnabled(True)
         self.runner.run(cmd, dur)
 
     def _export_done(self, ok, err):
-        self.btn_export.setEnabled(True)
+        self.btn_export.setEnabled(bool(self.model.regions))
         self.btn_cancel.setEnabled(False)
         if ok:
             self.log.appendPlainText(f"✅ Xong: {self.out.text()}")
@@ -577,102 +887,18 @@ class EditorTab(QWidget):
             QMessageBox.critical(self, "Lỗi xuất video", err[-600:] or "ffmpeg bị dừng")
 
 
-# ============================================================ Merge
-
-class MergeTab(QWidget):
-    def __init__(self):
-        super().__init__()
-        lay = QVBoxLayout(self)
-        lay.addWidget(QLabel("Ghép nhiều video thành một (theo thứ tự trong danh sách):"))
-        row = QHBoxLayout()
-        self.list = QListWidget()
-        row.addWidget(self.list, 1)
-        col = QVBoxLayout()
-        for text, fn in (("➕ Thêm", self.add), ("➖ Xoá", self.remove),
-                         ("⬆ Lên", lambda: self.move(-1)), ("⬇ Xuống", lambda: self.move(1))):
-            b = QPushButton(text)
-            b.clicked.connect(fn)
-            col.addWidget(b)
-        col.addStretch()
-        row.addLayout(col)
-        lay.addLayout(row, 1)
-        self.reencode = QCheckBox("Nén lại (dùng khi các video khác độ phân giải / định dạng)")
-        lay.addWidget(self.reencode)
-        out_row = QHBoxLayout()
-        self.out = QLineEdit(os.path.join(DEFAULT_OUT, "merged.mp4"))
-        bo = QPushButton("...")
-        bo.setMaximumWidth(40)
-        bo.clicked.connect(lambda: browse_save(self, self.out))
-        out_row.addWidget(QLabel("Lưu vào:"))
-        out_row.addWidget(self.out)
-        out_row.addWidget(bo)
-        lay.addLayout(out_row)
-        self.btn = QPushButton("🔗 Ghép video")
-        self.btn.setMinimumHeight(36)
-        self.btn.clicked.connect(self.merge)
-        lay.addWidget(self.btn)
-        self.bar = QProgressBar()
-        lay.addWidget(self.bar)
-        self.log = QPlainTextEdit()
-        self.log.setReadOnly(True)
-        self.log.setMaximumHeight(120)
-        lay.addWidget(self.log)
-        self.runner = FFmpegRunner(self)
-        self.runner.progress.connect(self.bar.setValue)
-        self.runner.log.connect(self.log.appendPlainText)
-        self.runner.finished.connect(self._done)
-
-    def add(self):
-        files, _ = QFileDialog.getOpenFileNames(self, "Chọn video", DEFAULT_OUT, "Video (*.mp4 *.ts *.mkv *.mov)")
-        self.list.addItems(files)
-
-    def remove(self):
-        for it in self.list.selectedItems():
-            self.list.takeItem(self.list.row(it))
-
-    def move(self, d):
-        r = self.list.currentRow()
-        if r < 0 or not (0 <= r + d < self.list.count()):
-            return
-        it = self.list.takeItem(r)
-        self.list.insertItem(r + d, it)
-        self.list.setCurrentRow(r + d)
-
-    def merge(self):
-        files = [self.list.item(i).text() for i in range(self.list.count())]
-        if len(files) < 2:
-            QMessageBox.warning(self, "Thiếu video", "Cần ít nhất 2 video.")
-            return
-        total = 0.0
-        for p in files:
-            try:
-                total += ve.probe(p)["duration"]
-            except Exception:
-                pass
-        cmd, list_path = ve.build_merge_cmd(files, self.out.text(), self.reencode.isChecked())
-        self.btn.setEnabled(False)
-        self.bar.setValue(0)
-        self.runner.run(cmd, total or None, cleanup=[list_path])
-
-    def _done(self, ok, err):
-        self.btn.setEnabled(True)
-        self.log.appendPlainText(f"✅ Xong: {self.out.text()}" if ok else "❌ Lỗi:\n" + err)
-
-
 # ============================================================ Main window
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Nimo Tool - Tải & Chỉnh sửa video")
-        self.resize(1150, 720)
+        self.resize(1400, 820)
         tabs = QTabWidget()
         self.dl = DownloadTab()
         self.ed = EditorTab()
-        self.mg = MergeTab()
         tabs.addTab(self.dl, "⬇ Tải video")
         tabs.addTab(self.ed, "✂ Chỉnh sửa")
-        tabs.addTab(self.mg, "🔗 Ghép video")
         self.dl.open_in_editor.connect(lambda p: (self.ed.load(p), tabs.setCurrentWidget(self.ed)))
         self.setCentralWidget(tabs)
         self.tabs = tabs
@@ -680,17 +906,18 @@ class MainWindow(QMainWindow):
     def closeEvent(self, e):
         if self.dl.worker:
             self.dl.worker.dl.stop()
-        self.ed.runner.kill()
-        self.mg.runner.kill()
+        self.ed.shutdown()
         super().closeEvent(e)
 
 
 def main():
     app = QApplication(sys.argv)
     app.setFont(QFont("Segoe UI", 10))
-    if not shutil.which("ffmpeg"):
+    if not ffbin.available():
         QMessageBox.critical(None, "Thiếu ffmpeg",
-                             "Không tìm thấy ffmpeg. Cài bằng: winget install Gyan.FFmpeg")
+                             "Không tìm thấy ffmpeg trong thư mục bin/ của tool.\n"
+                             "Chạy lệnh sau trong thư mục tool để tải về (không cài global):\n\n"
+                             "python setup_ffmpeg.py")
         return 1
     w = MainWindow()
     w.show()
